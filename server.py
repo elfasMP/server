@@ -57,7 +57,7 @@ async def ping_loop():
         muertos = []
         for ws, client in list(clients.items()):
             try:
-                await ws.send_json({"type": "ping"})
+                await ws.send_json({"_": "ping"})
             except Exception:
                 log.warning(f"Cliente {client.ip} no respondió al ping, desconectando.")
                 muertos.append(ws)
