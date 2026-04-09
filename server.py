@@ -24,7 +24,7 @@ app.add_middleware(
 #  CONFIGURACIÓN — ajusta aquí
 # ══════════════════════════════
 MAX_MESSAGE_LENGTH   = 500   # caracteres máximos por mensaje
-MAX_MESSAGES_PER_SEC = 3     # mensajes máximos por segundo por cliente
+MAX_MESSAGES_PER_SEC = 20    # mensajes máximos por segundo por cliente
 MAX_CLIENTS          = 20    # conexiones simultáneas máximas
 PING_INTERVAL        = 30    # segundos entre cada ping
 
