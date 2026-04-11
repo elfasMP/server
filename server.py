@@ -1,9 +1,11 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import asyncio
 import time
 import json
 import logging
+import os
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,23 +23,112 @@ app.add_middleware(
 )
 
 # ══════════════════════════════
-#  CONFIGURACIÓN — ajusta aquí
+#  CONFIGURACIÓN
 # ══════════════════════════════
-MAX_MESSAGE_LENGTH   = 500   # caracteres máximos por mensaje
-MAX_MESSAGES_PER_SEC = 20    # mensajes máximos por segundo por cliente
-MAX_CLIENTS          = 20    # conexiones simultáneas máximas
-PING_INTERVAL        = 30    # segundos entre cada ping
+MAX_MESSAGE_LENGTH   = 500
+MAX_MESSAGES_PER_SEC = 20
+MAX_CLIENTS          = 20
+PING_INTERVAL        = 30
+COMMENTS_FILE        = "comments.json"
 
 
+# ══════════════════════════════
+#  COMENTARIOS - helpers JSON
+# ══════════════════════════════
+def load_comments() -> list:
+    if not os.path.exists(COMMENTS_FILE):
+        return []
+    try:
+        with open(COMMENTS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+def save_comments(comments: list):
+    with open(COMMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(comments, f, ensure_ascii=False, indent=2)
+
+
+# ══════════════════════════════
+#  MODELOS
+# ══════════════════════════════
+class CommentIn(BaseModel):
+    name: str
+    text: str
+
+class ReactionIn(BaseModel):
+    type: str        # "like" o "dislike"
+    device_id: str   # id único del dispositivo para limitar 1 voto
+
+
+# ══════════════════════════════
+#  ENDPOINTS COMENTARIOS
+# ══════════════════════════════
+
+@app.get("/comments")
+def get_comments():
+    """Devuelve todos los comentarios ordenados por fecha (más nuevo primero)."""
+    comments = load_comments()
+    return sorted(comments, key=lambda c: c["timestamp"], reverse=True)
+
+
+@app.post("/comments")
+def post_comment(body: CommentIn):
+    """Guarda un nuevo comentario."""
+    if not body.name.strip() or not body.text.strip():
+        return {"error": "Nombre y texto son obligatorios"}
+    if len(body.text) > 500:
+        return {"error": "Comentario demasiado largo"}
+
+    comments = load_comments()
+    new_comment = {
+        "id": str(int(time.time() * 1000)),
+        "name": body.name.strip()[:50],
+        "initials": "".join(w[0].upper() for w in body.name.strip().split()[:2]),
+        "text": body.text.strip(),
+        "timestamp": time.time(),
+        "date": time.strftime("%d/%m/%Y %H:%M"),
+        "likes": 0,
+        "dislikes": 0,
+        "voters": []   # lista de device_id que ya votaron
+    }
+    comments.append(new_comment)
+    save_comments(comments)
+    log.info(f"Nuevo comentario de '{new_comment['name']}'")
+    return new_comment
+
+
+@app.post("/comments/{comment_id}/react")
+def react_comment(comment_id: str, body: ReactionIn):
+    """Da like o dislike a un comentario. 1 voto por dispositivo."""
+    if body.type not in ("like", "dislike"):
+        return {"error": "Tipo inválido"}
+
+    comments = load_comments()
+    for c in comments:
+        if c["id"] == comment_id:
+            if body.device_id in c.get("voters", []):
+                return {"error": "Ya votaste en este comentario"}
+            c[body.type + "s"] += 1
+            c.setdefault("voters", []).append(body.device_id)
+            save_comments(comments)
+            log.info(f"{body.type} en comentario {comment_id} de dispositivo {body.device_id[:8]}")
+            return {"ok": True, "likes": c["likes"], "dislikes": c["dislikes"]}
+
+    return {"error": "Comentario no encontrado"}
+
+
+# ══════════════════════════════
+#  CHAT - código original
+# ══════════════════════════════
 class Client:
     def __init__(self, websocket: WebSocket):
         self.ws = websocket
         self.ip = websocket.client.host
-        self.message_times = []  # timestamps de mensajes recientes
-        self.warned = False      # ya fue advertido por spam
+        self.message_times = []
+        self.warned = False
 
     def is_rate_limited(self) -> bool:
-        """Devuelve True si el cliente mandó demasiados mensajes en el último segundo."""
         now = time.time()
         self.message_times = [t for t in self.message_times if now - t < 1.0]
         if len(self.message_times) >= MAX_MESSAGES_PER_SEC:
@@ -46,12 +137,10 @@ class Client:
         return False
 
 
-# Diccionario: websocket -> Client
 clients: dict[WebSocket, Client] = {}
 
 
 async def ping_loop():
-    """Manda ping a todos los clientes cada PING_INTERVAL segundos."""
     while True:
         await asyncio.sleep(PING_INTERVAL)
         muertos = []
@@ -76,7 +165,6 @@ async def startup():
 
 
 async def broadcast(data: dict, exclude: WebSocket = None):
-    """Envía un mensaje a todos los clientes conectados."""
     muertos = []
     for ws in list(clients.keys()):
         if ws == exclude:
@@ -91,7 +179,6 @@ async def broadcast(data: dict, exclude: WebSocket = None):
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    # Rechazar si hay demasiados clientes
     if len(clients) >= MAX_CLIENTS:
         await websocket.close(code=1008, reason="Servidor lleno")
         log.warning("Conexión rechazada: servidor lleno")
@@ -106,16 +193,13 @@ async def websocket_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_text()
 
-            # ── Validar tamaño ──
             if len(data) > MAX_MESSAGE_LENGTH:
                 await websocket.send_json({
                     "type": "error",
                     "text": f"Mensaje demasiado largo (máx {MAX_MESSAGE_LENGTH} caracteres)"
                 })
-                log.warning(f"{client.ip} mandó mensaje de {len(data)} chars (límite: {MAX_MESSAGE_LENGTH})")
                 continue
 
-            # ── Validar rate limit ──
             if client.is_rate_limited():
                 if not client.warned:
                     await websocket.send_json({
@@ -123,12 +207,10 @@ async def websocket_endpoint(websocket: WebSocket):
                         "text": "Estás enviando mensajes muy rápido, espera un momento."
                     })
                     client.warned = True
-                    log.warning(f"{client.ip} está siendo limitado por rate limit")
                 continue
             else:
                 client.warned = False
 
-            # ── Validar que sea JSON válido ──
             try:
                 parsed = json.loads(data)
             except json.JSONDecodeError:
@@ -138,7 +220,6 @@ async def websocket_endpoint(websocket: WebSocket):
                 })
                 continue
 
-            # ── Reenviar a todos los demás ──
             await broadcast(parsed, exclude=websocket)
             log.info(f"Mensaje de {client.ip} ({parsed.get('name','?')}): {str(parsed.get('text',''))[:60]}")
 
