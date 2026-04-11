@@ -33,7 +33,7 @@ COMMENTS_FILE        = "comments.json"
 
 
 # ══════════════════════════════
-#  COMENTARIOS - helpers JSON
+#  COMENTARIOS - JSON
 # ══════════════════════════════
 def load_comments() -> list:
     if not os.path.exists(COMMENTS_FILE):
@@ -55,10 +55,11 @@ def save_comments(comments: list):
 class CommentIn(BaseModel):
     name: str
     text: str
+    page: str = "default"
 
 class ReactionIn(BaseModel):
-    type: str        # "like" o "dislike"
-    device_id: str   # id único del dispositivo para limitar 1 voto
+    type: str
+    device_id: str
 
 
 # ══════════════════════════════
@@ -66,15 +67,14 @@ class ReactionIn(BaseModel):
 # ══════════════════════════════
 
 @app.get("/comments")
-def get_comments():
-    """Devuelve todos los comentarios ordenados por fecha (más nuevo primero)."""
+def get_comments(page: str = "default"):
     comments = load_comments()
-    return sorted(comments, key=lambda c: c["timestamp"], reverse=True)
+    filtered = [c for c in comments if c.get("page") == page]
+    return sorted(filtered, key=lambda c: c["timestamp"], reverse=True)
 
 
 @app.post("/comments")
 def post_comment(body: CommentIn):
-    """Guarda un nuevo comentario."""
     if not body.name.strip() or not body.text.strip():
         return {"error": "Nombre y texto son obligatorios"}
     if len(body.text) > 500:
@@ -90,17 +90,17 @@ def post_comment(body: CommentIn):
         "date": time.strftime("%d/%m/%Y %H:%M"),
         "likes": 0,
         "dislikes": 0,
-        "voters": []   # lista de device_id que ya votaron
+        "voters": [],
+        "page": body.page
     }
     comments.append(new_comment)
     save_comments(comments)
-    log.info(f"Nuevo comentario de '{new_comment['name']}'")
+    log.info(f"Nuevo comentario de '{new_comment['name']}' en página '{body.page}'")
     return new_comment
 
 
 @app.post("/comments/{comment_id}/react")
 def react_comment(comment_id: str, body: ReactionIn):
-    """Da like o dislike a un comentario. 1 voto por dispositivo."""
     if body.type not in ("like", "dislike"):
         return {"error": "Tipo inválido"}
 
@@ -112,7 +112,7 @@ def react_comment(comment_id: str, body: ReactionIn):
             c[body.type + "s"] += 1
             c.setdefault("voters", []).append(body.device_id)
             save_comments(comments)
-            log.info(f"{body.type} en comentario {comment_id} de dispositivo {body.device_id[:8]}")
+            log.info(f"{body.type} en comentario {comment_id}")
             return {"ok": True, "likes": c["likes"], "dislikes": c["dislikes"]}
 
     return {"error": "Comentario no encontrado"}
@@ -148,7 +148,7 @@ async def ping_loop():
             try:
                 await ws.send_text("")
             except Exception:
-                log.warning(f"Cliente {client.ip} no respondió al ping, desconectando.")
+                log.warning(f"Cliente {client.ip} no respondió al ping.")
                 muertos.append(ws)
         for ws in muertos:
             clients.pop(ws, None)
