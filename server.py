@@ -54,8 +54,13 @@ def init_db():
             dislikes    INTEGER DEFAULT 0,
             voters      TEXT DEFAULT '[]',
             timestamp   REAL NOT NULL,
-            date        TEXT NOT NULL
+            date        TEXT NOT NULL,
+            parent_id   TEXT DEFAULT NULL
         )
+    """)
+    # Si la tabla ya existia, agregar parent_id si no existe
+    cur.execute("""
+        ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL
     """)
     conn.commit()
     cur.close()
@@ -70,6 +75,7 @@ class CommentIn(BaseModel):
     name: str
     text: str
     page: str = "default"
+    parent_id: str = None   # None = comentario normal, id = respuesta
 
 class ReactionIn(BaseModel):
     type: str
@@ -84,20 +90,40 @@ class ReactionIn(BaseModel):
 def get_comments(page: str = "default"):
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM comments WHERE page = %s ORDER BY timestamp DESC",
-        (page,)
-    )
-    rows = cur.fetchall()
+
+    # Traer comentarios principales
+    cur.execute("""
+        SELECT * FROM comments
+        WHERE page = %s AND parent_id IS NULL
+        ORDER BY timestamp DESC
+    """, (page,))
+    parents = [dict(r) for r in cur.fetchall()]
+
+    # Traer todas las respuestas de esta página
+    cur.execute("""
+        SELECT * FROM comments
+        WHERE page = %s AND parent_id IS NOT NULL
+        ORDER BY timestamp ASC
+    """, (page,))
+    replies = [dict(r) for r in cur.fetchall()]
+
     cur.close()
     conn.close()
-    # convertir voters de string JSON a lista
-    result = []
-    for row in rows:
-        r = dict(row)
+
+    # Parsear voters y anidar respuestas dentro del padre
+    reply_map = {}
+    for r in replies:
         r["voters"] = json.loads(r["voters"])
-        result.append(r)
-    return result
+        pid = r["parent_id"]
+        if pid not in reply_map:
+            reply_map[pid] = []
+        reply_map[pid].append(r)
+
+    for p in parents:
+        p["voters"] = json.loads(p["voters"])
+        p["replies"] = reply_map.get(p["id"], [])
+
+    return parents
 
 
 @app.post("/comments")
@@ -118,20 +144,23 @@ def post_comment(body: CommentIn):
         "voters":    "[]",
         "timestamp": time.time(),
         "date":      time.strftime("%d/%m/%Y %H:%M"),
+        "parent_id": body.parent_id,
     }
 
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO comments (id, name, initials, text, page, likes, dislikes, voters, timestamp, date)
-        VALUES (%(id)s, %(name)s, %(initials)s, %(text)s, %(page)s, %(likes)s, %(dislikes)s, %(voters)s, %(timestamp)s, %(date)s)
+        INSERT INTO comments (id, name, initials, text, page, likes, dislikes, voters, timestamp, date, parent_id)
+        VALUES (%(id)s, %(name)s, %(initials)s, %(text)s, %(page)s, %(likes)s, %(dislikes)s, %(voters)s, %(timestamp)s, %(date)s, %(parent_id)s)
     """, new_comment)
     conn.commit()
     cur.close()
     conn.close()
 
     new_comment["voters"] = []
-    log.info(f"Nuevo comentario de '{new_comment['name']}' en '{body.page}'")
+    new_comment["replies"] = []
+    tipo = "respuesta" if body.parent_id else "comentario"
+    log.info(f"Nuevo {tipo} de '{new_comment['name']}' en '{body.page}'")
     return new_comment
 
 
