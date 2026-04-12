@@ -6,6 +6,8 @@ import time
 import json
 import logging
 import os
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,24 +31,36 @@ MAX_MESSAGE_LENGTH   = 500
 MAX_MESSAGES_PER_SEC = 20
 MAX_CLIENTS          = 20
 PING_INTERVAL        = 30
-COMMENTS_FILE        = "comments.json"
+DATABASE_URL         = os.environ.get("DATABASE_URL")
 
 
 # ══════════════════════════════
-#  COMENTARIOS - JSON
+#  BASE DE DATOS
 # ══════════════════════════════
-def load_comments() -> list:
-    if not os.path.exists(COMMENTS_FILE):
-        return []
-    try:
-        with open(COMMENTS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+def get_conn():
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
-def save_comments(comments: list):
-    with open(COMMENTS_FILE, "w", encoding="utf-8") as f:
-        json.dump(comments, f, ensure_ascii=False, indent=2)
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS comments (
+            id          TEXT PRIMARY KEY,
+            name        TEXT NOT NULL,
+            initials    TEXT NOT NULL,
+            text        TEXT NOT NULL,
+            page        TEXT NOT NULL DEFAULT 'default',
+            likes       INTEGER DEFAULT 0,
+            dislikes    INTEGER DEFAULT 0,
+            voters      TEXT DEFAULT '[]',
+            timestamp   REAL NOT NULL,
+            date        TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    log.info("Base de datos lista ✓")
 
 
 # ══════════════════════════════
@@ -68,9 +82,22 @@ class ReactionIn(BaseModel):
 
 @app.get("/comments")
 def get_comments(page: str = "default"):
-    comments = load_comments()
-    filtered = [c for c in comments if c.get("page") == page]
-    return sorted(filtered, key=lambda c: c["timestamp"], reverse=True)
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM comments WHERE page = %s ORDER BY timestamp DESC",
+        (page,)
+    )
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    # convertir voters de string JSON a lista
+    result = []
+    for row in rows:
+        r = dict(row)
+        r["voters"] = json.loads(r["voters"])
+        result.append(r)
+    return result
 
 
 @app.post("/comments")
@@ -80,22 +107,31 @@ def post_comment(body: CommentIn):
     if len(body.text) > 500:
         return {"error": "Comentario demasiado largo"}
 
-    comments = load_comments()
     new_comment = {
-        "id": str(int(time.time() * 1000)),
-        "name": body.name.strip()[:50],
-        "initials": "".join(w[0].upper() for w in body.name.strip().split()[:2]),
-        "text": body.text.strip(),
+        "id":        str(int(time.time() * 1000)),
+        "name":      body.name.strip()[:50],
+        "initials":  "".join(w[0].upper() for w in body.name.strip().split()[:2]),
+        "text":      body.text.strip(),
+        "page":      body.page,
+        "likes":     0,
+        "dislikes":  0,
+        "voters":    "[]",
         "timestamp": time.time(),
-        "date": time.strftime("%d/%m/%Y %H:%M"),
-        "likes": 0,
-        "dislikes": 0,
-        "voters": [],
-        "page": body.page
+        "date":      time.strftime("%d/%m/%Y %H:%M"),
     }
-    comments.append(new_comment)
-    save_comments(comments)
-    log.info(f"Nuevo comentario de '{new_comment['name']}' en página '{body.page}'")
+
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO comments (id, name, initials, text, page, likes, dislikes, voters, timestamp, date)
+        VALUES (%(id)s, %(name)s, %(initials)s, %(text)s, %(page)s, %(likes)s, %(dislikes)s, %(voters)s, %(timestamp)s, %(date)s)
+    """, new_comment)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    new_comment["voters"] = []
+    log.info(f"Nuevo comentario de '{new_comment['name']}' en '{body.page}'")
     return new_comment
 
 
@@ -104,18 +140,38 @@ def react_comment(comment_id: str, body: ReactionIn):
     if body.type not in ("like", "dislike"):
         return {"error": "Tipo inválido"}
 
-    comments = load_comments()
-    for c in comments:
-        if c["id"] == comment_id:
-            if body.device_id in c.get("voters", []):
-                return {"error": "Ya votaste en este comentario"}
-            c[body.type + "s"] += 1
-            c.setdefault("voters", []).append(body.device_id)
-            save_comments(comments)
-            log.info(f"{body.type} en comentario {comment_id}")
-            return {"ok": True, "likes": c["likes"], "dislikes": c["dislikes"]}
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM comments WHERE id = %s", (comment_id,))
+    row = cur.fetchone()
 
-    return {"error": "Comentario no encontrado"}
+    if not row:
+        cur.close()
+        conn.close()
+        return {"error": "Comentario no encontrado"}
+
+    voters = json.loads(row["voters"])
+    if body.device_id in voters:
+        cur.close()
+        conn.close()
+        return {"error": "Ya votaste en este comentario"}
+
+    voters.append(body.device_id)
+    column = "likes" if body.type == "like" else "dislikes"
+
+    cur.execute(
+        f"UPDATE comments SET {column} = {column} + 1, voters = %s WHERE id = %s",
+        (json.dumps(voters), comment_id)
+    )
+    conn.commit()
+
+    cur.execute("SELECT likes, dislikes FROM comments WHERE id = %s", (comment_id,))
+    updated = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    log.info(f"{body.type} en comentario {comment_id}")
+    return {"ok": True, "likes": updated["likes"], "dislikes": updated["dislikes"]}
 
 
 # ══════════════════════════════
@@ -160,6 +216,7 @@ async def ping_loop():
 
 @app.on_event("startup")
 async def startup():
+    init_db()
     asyncio.create_task(ping_loop())
     log.info("Servidor iniciado ✓")
 
