@@ -36,6 +36,7 @@ PING_INTERVAL        = 30
 DATABASE_URL         = os.environ.get("DATABASE_URL")
 CACHE_TTL            = 5
 MAX_HTTP_REQ_PER_SEC = 10
+COMMENT_COOLDOWN_SECS = 60  # 1 comentario por minuto por IP
 
 
 # ══════════════════════════════
@@ -116,6 +117,21 @@ def is_http_rate_limited(ip: str) -> bool:
     if len(http_requests[ip]) >= MAX_HTTP_REQ_PER_SEC:
         return True
     http_requests[ip].append(now)
+    return False
+
+
+# ══════════════════════════════
+#  LÍMITE DE COMENTARIOS
+# ══════════════════════════════
+comment_cooldown: dict = {}
+
+def is_comment_limited(ip: str) -> bool:
+    now = time.time()
+    last = comment_cooldown.get(ip, 0)
+    if now - last < COMMENT_COOLDOWN_SECS:
+        remaining = int(COMMENT_COOLDOWN_SECS - (now - last))
+        return remaining
+    comment_cooldown[ip] = now
     return False
 
 
@@ -214,8 +230,16 @@ def get_comments(request: Request, page: str = "default"):
 @app.post("/comments")
 def post_comment(request: Request, body: CommentIn):
     ip = request.client.host
+
     if is_http_rate_limited(ip):
         return {"error": "Demasiadas solicitudes, espera un momento"}
+
+    # Solo aplicar cooldown a comentarios principales, no a respuestas
+    if not body.parent_id:
+        remaining = is_comment_limited(ip)
+        if remaining:
+            log.warning(f"IP {ip} bloqueada por cooldown, faltan {remaining}s")
+            return {"error": f"Espera {remaining} segundos antes de comentar de nuevo"}
 
     new_comment = {
         "id":        str(int(time.time() * 1000)),
