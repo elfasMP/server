@@ -1,13 +1,14 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
+from psycopg2 import pool
 import asyncio
 import time
 import json
 import logging
 import os
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import html
+from collections import defaultdict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -32,15 +33,28 @@ MAX_MESSAGES_PER_SEC = 20
 MAX_CLIENTS          = 20
 PING_INTERVAL        = 30
 DATABASE_URL         = os.environ.get("DATABASE_URL")
+CACHE_TTL            = 5      # segundos de caché
+MAX_HTTP_REQ_PER_SEC = 10     # rate limit HTTP por IP
 
 
 # ══════════════════════════════
-#  BASE DE DATOS
+#  POOL DE CONEXIONES
 # ══════════════════════════════
+db_pool = None
+
 def get_conn():
-    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    return db_pool.getconn()
+
+def release_conn(conn):
+    db_pool.putconn(conn)
 
 def init_db():
+    global db_pool
+    db_pool = pool.ThreadedConnectionPool(
+        minconn=2,
+        maxconn=10,
+        dsn=DATABASE_URL
+    )
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
@@ -58,14 +72,46 @@ def init_db():
             parent_id   TEXT DEFAULT NULL
         )
     """)
-    # Si la tabla ya existia, agregar parent_id si no existe
-    cur.execute("""
-        ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL
-    """)
+    cur.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL")
     conn.commit()
     cur.close()
-    conn.close()
+    release_conn(conn)
     log.info("Base de datos lista ✓")
+
+
+# ══════════════════════════════
+#  CACHÉ
+# ══════════════════════════════
+cache: dict = {}
+
+def get_cache(key):
+    if key in cache:
+        data, ts = cache[key]
+        if time.time() - ts < CACHE_TTL:
+            return data
+        del cache[key]
+    return None
+
+def set_cache(key, data):
+    cache[key] = (data, time.time())
+
+def invalidate_cache(page):
+    key = f"comments_{page}"
+    cache.pop(key, None)
+
+
+# ══════════════════════════════
+#  RATE LIMIT HTTP
+# ══════════════════════════════
+http_requests: dict = defaultdict(list)
+
+def is_http_rate_limited(ip: str) -> bool:
+    now = time.time()
+    http_requests[ip] = [t for t in http_requests[ip] if now - t < 1.0]
+    if len(http_requests[ip]) >= MAX_HTTP_REQ_PER_SEC:
+        return True
+    http_requests[ip].append(now)
+    return False
 
 
 # ══════════════════════════════
@@ -75,11 +121,39 @@ class CommentIn(BaseModel):
     name: str
     text: str
     page: str = "default"
-    parent_id: str = None   # None = comentario normal, id = respuesta
+    parent_id: str = None
+
+    @validator('name')
+    def clean_name(cls, v):
+        v = v.strip()[:50]
+        if not v:
+            raise ValueError('Nombre vacío')
+        return html.escape(v)
+
+    @validator('text')
+    def clean_text(cls, v):
+        v = v.strip()[:500]
+        if not v:
+            raise ValueError('Texto vacío')
+        return html.escape(v)
+
+    @validator('page')
+    def clean_page(cls, v):
+        return v.strip()[:50]
+
+    @validator('parent_id')
+    def clean_parent(cls, v):
+        if v:
+            return v.strip()[:20]
+        return v
 
 class ReactionIn(BaseModel):
     type: str
     device_id: str
+
+    @validator('device_id')
+    def clean_device(cls, v):
+        return v.strip()[:60]
 
 
 # ══════════════════════════════
@@ -87,57 +161,62 @@ class ReactionIn(BaseModel):
 # ══════════════════════════════
 
 @app.get("/comments")
-def get_comments(page: str = "default"):
+def get_comments(request: Request, page: str = "default"):
+    ip = request.client.host
+    if is_http_rate_limited(ip):
+        return {"error": "Demasiadas solicitudes, espera un momento"}
+
+    page = page.strip()[:50]
+    cache_key = f"comments_{page}"
+    cached = get_cache(cache_key)
+    if cached is not None:
+        return cached
+
     conn = get_conn()
-    cur = conn.cursor()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT * FROM comments
+            WHERE page = %s AND parent_id IS NULL
+            ORDER BY timestamp DESC
+        """, (page,))
+        parents = [dict(r) for r in cur.fetchall()]
 
-    # Traer comentarios principales
-    cur.execute("""
-        SELECT * FROM comments
-        WHERE page = %s AND parent_id IS NULL
-        ORDER BY timestamp DESC
-    """, (page,))
-    parents = [dict(r) for r in cur.fetchall()]
+        cur.execute("""
+            SELECT * FROM comments
+            WHERE page = %s AND parent_id IS NOT NULL
+            ORDER BY timestamp ASC
+        """, (page,))
+        replies = [dict(r) for r in cur.fetchall()]
+        cur.close()
+    finally:
+        release_conn(conn)
 
-    # Traer todas las respuestas de esta página
-    cur.execute("""
-        SELECT * FROM comments
-        WHERE page = %s AND parent_id IS NOT NULL
-        ORDER BY timestamp ASC
-    """, (page,))
-    replies = [dict(r) for r in cur.fetchall()]
-
-    cur.close()
-    conn.close()
-
-    # Parsear voters y anidar respuestas dentro del padre
     reply_map = {}
     for r in replies:
         r["voters"] = json.loads(r["voters"])
         pid = r["parent_id"]
-        if pid not in reply_map:
-            reply_map[pid] = []
-        reply_map[pid].append(r)
+        reply_map.setdefault(pid, []).append(r)
 
     for p in parents:
         p["voters"] = json.loads(p["voters"])
         p["replies"] = reply_map.get(p["id"], [])
 
+    set_cache(cache_key, parents)
     return parents
 
 
 @app.post("/comments")
-def post_comment(body: CommentIn):
-    if not body.name.strip() or not body.text.strip():
-        return {"error": "Nombre y texto son obligatorios"}
-    if len(body.text) > 500:
-        return {"error": "Comentario demasiado largo"}
+def post_comment(request: Request, body: CommentIn):
+    ip = request.client.host
+    if is_http_rate_limited(ip):
+        return {"error": "Demasiadas solicitudes, espera un momento"}
 
     new_comment = {
         "id":        str(int(time.time() * 1000)),
-        "name":      body.name.strip()[:50],
-        "initials":  "".join(w[0].upper() for w in body.name.strip().split()[:2]),
-        "text":      body.text.strip(),
+        "name":      body.name,
+        "initials":  "".join(w[0].upper() for w in body.name.split()[:2]),
+        "text":      body.text,
         "page":      body.page,
         "likes":     0,
         "dislikes":  0,
@@ -148,63 +227,72 @@ def post_comment(body: CommentIn):
     }
 
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO comments (id, name, initials, text, page, likes, dislikes, voters, timestamp, date, parent_id)
-        VALUES (%(id)s, %(name)s, %(initials)s, %(text)s, %(page)s, %(likes)s, %(dislikes)s, %(voters)s, %(timestamp)s, %(date)s, %(parent_id)s)
-    """, new_comment)
-    conn.commit()
-    cur.close()
-    conn.close()
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO comments (id, name, initials, text, page, likes, dislikes, voters, timestamp, date, parent_id)
+            VALUES (%(id)s, %(name)s, %(initials)s, %(text)s, %(page)s, %(likes)s, %(dislikes)s, %(voters)s, %(timestamp)s, %(date)s, %(parent_id)s)
+        """, new_comment)
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
 
+    invalidate_cache(body.page)
     new_comment["voters"] = []
     new_comment["replies"] = []
     tipo = "respuesta" if body.parent_id else "comentario"
-    log.info(f"Nuevo {tipo} de '{new_comment['name']}' en '{body.page}'")
+    log.info(f"Nuevo {tipo} de '{body.name}' en '{body.page}' desde {ip}")
     return new_comment
 
 
 @app.post("/comments/{comment_id}/react")
-def react_comment(comment_id: str, body: ReactionIn):
+def react_comment(request: Request, comment_id: str, body: ReactionIn):
+    ip = request.client.host
+    if is_http_rate_limited(ip):
+        return {"error": "Demasiadas solicitudes, espera un momento"}
+
     if body.type not in ("like", "dislike"):
         return {"error": "Tipo inválido"}
 
+    comment_id = comment_id.strip()[:20]
+
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM comments WHERE id = %s", (comment_id,))
-    row = cur.fetchone()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT * FROM comments WHERE id = %s", (comment_id,))
+        row = cur.fetchone()
 
-    if not row:
+        if not row:
+            cur.close()
+            return {"error": "Comentario no encontrado"}
+
+        voters = json.loads(row["voters"])
+        if body.device_id in voters:
+            cur.close()
+            return {"error": "Ya votaste en este comentario"}
+
+        voters.append(body.device_id)
+        column = "likes" if body.type == "like" else "dislikes"
+        cur.execute(
+            f"UPDATE comments SET {column} = {column} + 1, voters = %s WHERE id = %s",
+            (json.dumps(voters), comment_id)
+        )
+        conn.commit()
+
+        cur.execute("SELECT likes, dislikes, page FROM comments WHERE id = %s", (comment_id,))
+        updated = cur.fetchone()
         cur.close()
-        conn.close()
-        return {"error": "Comentario no encontrado"}
+    finally:
+        release_conn(conn)
 
-    voters = json.loads(row["voters"])
-    if body.device_id in voters:
-        cur.close()
-        conn.close()
-        return {"error": "Ya votaste en este comentario"}
-
-    voters.append(body.device_id)
-    column = "likes" if body.type == "like" else "dislikes"
-
-    cur.execute(
-        f"UPDATE comments SET {column} = {column} + 1, voters = %s WHERE id = %s",
-        (json.dumps(voters), comment_id)
-    )
-    conn.commit()
-
-    cur.execute("SELECT likes, dislikes FROM comments WHERE id = %s", (comment_id,))
-    updated = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    log.info(f"{body.type} en comentario {comment_id}")
+    invalidate_cache(updated["page"])
+    log.info(f"{body.type} en {comment_id} desde {ip}")
     return {"ok": True, "likes": updated["likes"], "dislikes": updated["dislikes"]}
 
 
 # ══════════════════════════════
-#  CHAT - código original
+#  CHAT
 # ══════════════════════════════
 class Client:
     def __init__(self, websocket: WebSocket):
