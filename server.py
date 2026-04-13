@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, validator
 from psycopg2 import pool
+from psycopg2.extras import RealDictCursor
 import asyncio
 import time
 import json
@@ -33,8 +34,8 @@ MAX_MESSAGES_PER_SEC = 20
 MAX_CLIENTS          = 20
 PING_INTERVAL        = 30
 DATABASE_URL         = os.environ.get("DATABASE_URL")
-CACHE_TTL            = 5      # segundos de caché
-MAX_HTTP_REQ_PER_SEC = 10     # rate limit HTTP por IP
+CACHE_TTL            = 5
+MAX_HTTP_REQ_PER_SEC = 10
 
 
 # ══════════════════════════════
@@ -43,7 +44,9 @@ MAX_HTTP_REQ_PER_SEC = 10     # rate limit HTTP por IP
 db_pool = None
 
 def get_conn():
-    return db_pool.getconn()
+    conn = db_pool.getconn()
+    conn.cursor_factory = RealDictCursor
+    return conn
 
 def release_conn(conn):
     db_pool.putconn(conn)
@@ -53,29 +56,32 @@ def init_db():
     db_pool = pool.ThreadedConnectionPool(
         minconn=2,
         maxconn=10,
-        dsn=DATABASE_URL
+        dsn=DATABASE_URL,
+        cursor_factory=RealDictCursor
     )
     conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS comments (
-            id          TEXT PRIMARY KEY,
-            name        TEXT NOT NULL,
-            initials    TEXT NOT NULL,
-            text        TEXT NOT NULL,
-            page        TEXT NOT NULL DEFAULT 'default',
-            likes       INTEGER DEFAULT 0,
-            dislikes    INTEGER DEFAULT 0,
-            voters      TEXT DEFAULT '[]',
-            timestamp   REAL NOT NULL,
-            date        TEXT NOT NULL,
-            parent_id   TEXT DEFAULT NULL
-        )
-    """)
-    cur.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL")
-    conn.commit()
-    cur.close()
-    release_conn(conn)
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS comments (
+                id          TEXT PRIMARY KEY,
+                name        TEXT NOT NULL,
+                initials    TEXT NOT NULL,
+                text        TEXT NOT NULL,
+                page        TEXT NOT NULL DEFAULT 'default',
+                likes       INTEGER DEFAULT 0,
+                dislikes    INTEGER DEFAULT 0,
+                voters      TEXT DEFAULT '[]',
+                timestamp   REAL NOT NULL,
+                date        TEXT NOT NULL,
+                parent_id   TEXT DEFAULT NULL
+            )
+        """)
+        cur.execute("ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_id TEXT DEFAULT NULL")
+        conn.commit()
+        cur.close()
+    finally:
+        release_conn(conn)
     log.info("Base de datos lista ✓")
 
 
@@ -96,8 +102,7 @@ def set_cache(key, data):
     cache[key] = (data, time.time())
 
 def invalidate_cache(page):
-    key = f"comments_{page}"
-    cache.pop(key, None)
+    cache.pop(f"comments_{page}", None)
 
 
 # ══════════════════════════════
